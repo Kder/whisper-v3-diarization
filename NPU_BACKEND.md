@@ -132,6 +132,24 @@ pip install funasr modelscope
 audio-transcription diarize meeting.mp3 --backend funasr
 ```
 
+### Larger ASR model: Fun-ASR-Nano-2512 (800M)
+
+The default `paraformer-zh` is only 220M parameters. The largest
+open-source ASR in the FunASR family is Tongyi Lab's **Fun-ASR-Nano-2512**
+(800M, trained on tens of millions of hours; the 7.7B Fun-ASR is
+closed-source). Select it with an environment variable:
+
+```bash
+set FUNASR_MODEL=FunAudioLLM/Fun-ASR-Nano-2512
+audio-transcription diarize meeting.mp3 --backend funasr
+```
+
+Fun-ASR-Nano is LLM-based: it punctuates natively (no ct-punc chain) and
+has **no CAM++ speaker chain**, so diarization automatically falls back to
+the pyannote path (HF token required, like `whispercpp`/`firered`).
+Measured on the same 5-minute meeting it is visibly more fluent and drops
+fewer clauses than paraformer-zh, at ~19x the compute (still CPU-only).
+
 ## Measured comparison (same 5-minute real-world Chinese meeting, CPU-only)
 
 | | `whispercpp` (NPU) + pyannote | `funasr` (CAM++) |
@@ -198,20 +216,23 @@ single-GPU inference paths).
 
 ### Measured comparison (same 5-minute real-world Chinese meeting)
 
-| | `funasr` (CPU) | `firered` LLM 8.3B (iGPU ROCm) | `whispercpp` (NPU) + pyannote | `pytorch` large-v3 (CPU) |
+| | `funasr` paraformer 220M (CPU) | `funasr` Fun-ASR-Nano 800M (CPU) | `firered` LLM 8.3B (iGPU ROCm) | `whispercpp` (NPU) + pyannote |
 | --- | --- | --- | --- | --- |
-| End-to-end time | **~17 s** | ~436 s | ~220 s | hours |
-| Transcription only | ~17 s | ~319 s (RTF ≈ 1.06) | ~98 s | — |
-| Chinese accuracy | good | **best** (CER 2.89% claim) | good | good |
-| Simplified + punctuation | yes | yes | occasional traditional bias | occasional traditional bias |
-| Speakers found | 5 | 2 | 2 | 2 |
-| HF token needed | **no** | yes (pyannote diarization) | yes | yes |
-| Hardware | any CPU | AMD iGPU (ROCm) or CPU | Ryzen AI NPU | any |
+| End-to-end time | **~17 s** | ~282 s | ~436 s | ~220 s |
+| Transcription only | ~17 s | ~190 s (RTF ≈ 0.6) | ~319 s (RTF ≈ 1.06) | ~98 s |
+| Chinese accuracy | good (drops clauses) | better (fluent, complete) | **best** (CER 2.89% claim) | good |
+| Simplified + punctuation | yes | yes | yes | occasional traditional bias |
+| Speakers found | 5 (CAM++) | 2 (pyannote) | 2 (pyannote) | 2 (pyannote) |
+| HF token needed | **no** | yes (pyannote diarization) | yes (pyannote diarization) | yes |
+| Hardware | any CPU | any CPU | AMD iGPU (ROCm) or CPU | Ryzen AI NPU |
 
 Backend selection guide:
 
-- **`funasr`** — default for Chinese meetings: fastest, no HF token,
-  built-in diarization.
+- **`funasr` + paraformer-zh** — default for Chinese meetings: fastest, no
+  HF token, built-in diarization.
+- **`funasr` + Fun-ASR-Nano** (`FUNASR_MODEL=FunAudioLLM/Fun-ASR-Nano-2512`)
+  — same toolchain, noticeably better Chinese transcription, still
+  CPU-only; needs an HF token for pyannote diarization.
 - **`firered`** — when Chinese transcription accuracy matters more than
   speed (formal minutes, downstream LLM summarization). AED variant
   (`asr_type="aed"`) is ~10x faster with slightly lower accuracy.

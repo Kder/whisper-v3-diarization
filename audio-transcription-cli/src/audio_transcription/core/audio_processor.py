@@ -54,9 +54,11 @@ class AudioProcessor:
             )
         else:
             self.transcriber = create_backend(backend, **(backend_options or {}))
-        # FunASR performs diarization internally (CAM++); WhisperX/pyannote
-        # (and its HuggingFace token) is not needed for that backend
-        if backend == "funasr":
+        # FunASR with a spk model (paraformer-zh + CAM++) performs
+        # diarization internally; WhisperX/pyannote (and its HuggingFace
+        # token) is not needed then. FunASR models without a spk chain
+        # (e.g. Fun-ASR-Nano) fall back to the pyannote path below.
+        if backend == "funasr" and getattr(self.transcriber, "spk_model", None):
             self.diarizer = None
         else:
             self.diarizer = WhisperXDiarizer(self.device, hf_token, model_size) if hf_token else None
@@ -154,7 +156,11 @@ class AudioProcessor:
         Returns:
             Dict with success status and results
         """
-        if self.backend_name != "funasr" and not self.diarizer:
+        has_builtin_spk = (
+            self.backend_name == "funasr"
+            and getattr(self.transcriber, "spk_model", None)
+        )
+        if not has_builtin_spk and not self.diarizer:
             return {
                 "success": False,
                 "error": "Diarization not available - no HuggingFace token provided"
@@ -178,7 +184,7 @@ class AudioProcessor:
                 }
 
             # Process with diarization
-            if self.backend_name == "funasr":
+            if has_builtin_spk:
                 # FunASR chains VAD + ASR + punctuation + CAM++ speaker
                 # clustering in a single call — no WhisperX/pyannote needed
                 logger.info("Running FunASR built-in diarization (CAM++)")

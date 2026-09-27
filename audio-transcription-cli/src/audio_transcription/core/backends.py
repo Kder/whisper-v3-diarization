@@ -324,24 +324,30 @@ class FunASRBackend(TranscriptionBackend):
 
     def __init__(
         self,
-        model: str = "paraformer-zh",
+        model: Optional[str] = None,
         vad_model: Optional[str] = "fsmn-vad",
         punc_model: Optional[str] = "ct-punc",
         spk_model: Optional[str] = "cam++",
         device: str = "cpu",
         batch_size_s: int = 300,
     ):
-        self.model = model
+        # FUNASR_MODEL env var selects e.g. the larger Fun-ASR-Nano-2512
+        # (800M, Tongyi Lab) instead of the default paraformer-zh (220M).
+        self.model = model or os.getenv("FUNASR_MODEL") or "paraformer-zh"
         self.vad_model = vad_model
         self.punc_model = punc_model
         self.spk_model = spk_model
         self.device = device
         self.batch_size_s = batch_size_s
         self._impl = None  # lazy AutoModel
+        if self._is_fun_asr_nano:
+            # No CAM++ chain for this model family — callers check
+            # spk_model to decide whether built-in diarization exists.
+            self.spk_model = None
 
         logger.info(
             "FunASRBackend initialized - model: %s, spk: %s, device: %s",
-            model, spk_model, device,
+            self.model, self.spk_model, device,
         )
 
     # ------------------------------------------------------------------ API
@@ -433,6 +439,13 @@ class FunASRBackend(TranscriptionBackend):
 
     # ------------------------------------------------------------- internal
 
+    @property
+    def _is_fun_asr_nano(self) -> bool:
+        """Fun-ASR-Nano (800M LLM-based ASR) — punctuates natively and does
+        not chain ct-punc / CAM++ the way paraformer-zh does."""
+        low = self.model.lower()
+        return "fun-asr" in low or "fun_asr" in low
+
     def _load(self) -> None:
         if self._impl is not None:
             return
@@ -445,10 +458,20 @@ class FunASRBackend(TranscriptionBackend):
         }
         if self.vad_model:
             kwargs["vad_model"] = self.vad_model
-        if self.punc_model:
-            kwargs["punc_model"] = self.punc_model
-        if self.spk_model:
-            kwargs["spk_model"] = self.spk_model
+            if self._is_fun_asr_nano:
+                kwargs["vad_kwargs"] = {"max_single_segment_time": 30000}
+        if self._is_fun_asr_nano:
+            # LLM-based: outputs punctuation itself; no CAM++ speaker chain
+            if self.punc_model or self.spk_model:
+                logger.info(
+                    "Fun-ASR-Nano does not chain punc/spk models; "
+                    "diarization falls back to pyannote"
+                )
+        else:
+            if self.punc_model:
+                kwargs["punc_model"] = self.punc_model
+            if self.spk_model:
+                kwargs["spk_model"] = self.spk_model
 
         logger.info("Loading FunASR pipeline: %s", kwargs)
         self._impl = AutoModel(**kwargs)
@@ -459,10 +482,17 @@ class FunASRBackend(TranscriptionBackend):
             "input": str(audio_path),
             "batch_size_s": self.batch_size_s,
         }
+        low = self.model.lower()
         # SenseVoice-family models accept language/itn; paraformer-zh does not
-        if "sensevoice" in self.model.lower():
+        if "sensevoice" in low:
             gen_kwargs["language"] = language or "auto"
             gen_kwargs["use_itn"] = True
+        elif self._is_fun_asr_nano:
+            gen_kwargs.pop("batch_size_s")
+            gen_kwargs["batch_size"] = 1
+            lang_map = {"zh": "中文", "en": "英文", "ja": "日文"}
+            gen_kwargs["language"] = lang_map.get((language or "zh")[:2], "中文")
+            gen_kwargs["itn"] = True
 
         res = self._impl.generate(**gen_kwargs)
         if not res:
@@ -489,6 +519,39 @@ class FunASRBackend(TranscriptionBackend):
             if "spk" in item:
                 seg["speaker"] = f"SPEAKER_{int(item['spk']):02d}"
             segments.append(seg)
+        if segments:
+            return segments
+        # Fun-ASR-Nano: no sentence_info, but token-level timestamps
+        # ([{"token", "start_time", "end_time", "score"}, ...], seconds).
+        # Rebuild sentence segments by splitting on sentence punctuation.
+        tokens = result.get("timestamps") or []
+        if tokens and isinstance(tokens[0], dict) and "token" in tokens[0]:
+            buf_text: List[str] = []
+            seg_start: Optional[float] = None
+            seg_end: Optional[float] = None
+            for tok in tokens:
+                piece = tok.get("token", "")
+                if seg_start is None and piece.strip():
+                    seg_start = float(tok.get("start_time", 0.0))
+                buf_text.append(piece)
+                if piece.strip():
+                    seg_end = float(tok.get("end_time", seg_end or 0.0))
+                if piece.strip() in "。！？；!?;":
+                    text = "".join(buf_text).strip()
+                    if text:
+                        segments.append({
+                            "start": seg_start or 0.0,
+                            "end": seg_end or seg_start or 0.0,
+                            "text": text,
+                        })
+                    buf_text, seg_start, seg_end = [], None, None
+            text = "".join(buf_text).strip()
+            if text:
+                segments.append({
+                    "start": seg_start or 0.0,
+                    "end": seg_end or seg_start or 0.0,
+                    "text": text,
+                })
         return segments
 
     @staticmethod

@@ -1,5 +1,7 @@
 """Command-line interface for audio transcription and diarization."""
 
+import os
+
 import typer
 from pathlib import Path
 from typing import List, Optional
@@ -200,8 +202,13 @@ def diarize_audio(
     _validate_backend(backend)
     _validate_speaker_counts(min_speakers, max_speakers)
 
-    # FunASR performs diarization internally (CAM++) and needs no HF token
-    if backend != "funasr" and not config.hf_token:
+    # FunASR with CAM++ (paraformer-zh) performs diarization internally and
+    # needs no HF token; Fun-ASR-Nano has no spk chain and uses pyannote.
+    funasr_model = (os.getenv("FUNASR_MODEL") or "").lower()
+    funasr_needs_token = backend == "funasr" and (
+        "fun-asr" in funasr_model or "fun_asr" in funasr_model
+    )
+    if (backend != "funasr" or funasr_needs_token) and not config.hf_token:
         console.print("❌ [red]HuggingFace token required for speaker diarization![/red]")
         console.print("Set HF_TOKEN environment variable or use --hf-token option.")
         console.print("Tip: --backend funasr performs diarization without a HuggingFace token.")
