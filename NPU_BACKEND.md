@@ -153,3 +153,68 @@ Notes:
   have the NPU stack set up.
 - SenseVoice (`model="iic/SenseVoiceSmall"`) is also supported as the ASR
   model and adds emotion / audio-event tags.
+
+## FireRedASR2S backend (top-accuracy Chinese ASR on AMD iGPU via ROCm)
+
+`--backend firered` runs Xiaohongshu's FireRedASR2 all-in-one system
+(FireRedVAD + FireRedLID + FireRedASR2 + FireRedPunc). The LLM variant
+(FireRedASR2-LLM, 8.3B: Qwen2-7B + speech encoder) reports the lowest
+publicly available Chinese CER (2.89% on AISHELL-1 test). Because it needs
+its own PyTorch build (ROCm gfx1151 nightly for Strix Halo iGPUs), it runs
+in a **dedicated venv** via a subprocess worker
+(`core/firered_worker.py`); diarization then reuses the transcript through
+pyannote like the `whispercpp` path.
+
+### Setup (Windows, Strix Halo gfx1151)
+
+```bash
+# 1. Dedicated venv with TheRock ROCm PyTorch (gfx1151 nightly)
+uv venv firered-venv
+firered-venv\Scripts\python -m pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch
+firered-venv\Scripts\python -m pip install --no-deps <FireRedASR2S source dir>
+firered-venv\Scripts\python -m pip install transformers==4.51.3 soundfile librosa ...
+
+# 2. Models (ModelScope, ~19 GB total)
+modelscope download --model FireRedTeam/FireRedASR2-LLM --local_dir pretrained_models/FireRedASR2-LLM
+modelscope download --model FireRedTeam/FireRedVAD   --local_dir pretrained_models/FireRedVAD
+modelscope download --model FireRedTeam/FireRedLID   --local_dir pretrained_models/FireRedLID
+modelscope download --model FireRedTeam/FireRedPunc  --local_dir pretrained_models/FireRedPunc
+
+# 3. One-line upstream patch: fireredasr2system.py accesses
+#    asr_result["confidence"] which the LLM path never returns — change the
+#    three occurrences to asr_result.get("confidence", 0).
+
+# 4. Point the backend at the venv (or edit FireRedBackend.DEFAULT_*)
+set FIRERED_PYTHON=<abs path>\firered-venv\Scripts\python.exe
+set FIRERED_MODELS_ROOT=<abs path>\pretrained_models
+
+audio-transcription diarize meeting.mp3 --backend firered --language zh
+```
+
+The worker also stubs `torch.distributed.tensor` at import time: TheRock
+Windows builds ship without `torch._C._distributed_c10d`, which
+transformers 4.51.x imports unconditionally (the symbols are never used on
+single-GPU inference paths).
+
+### Measured comparison (same 5-minute real-world Chinese meeting)
+
+| | `funasr` (CPU) | `firered` LLM 8.3B (iGPU ROCm) | `whispercpp` (NPU) + pyannote | `pytorch` large-v3 (CPU) |
+| --- | --- | --- | --- | --- |
+| End-to-end time | **~17 s** | ~436 s | ~220 s | hours |
+| Transcription only | ~17 s | ~319 s (RTF ≈ 1.06) | ~98 s | — |
+| Chinese accuracy | good | **best** (CER 2.89% claim) | good | good |
+| Simplified + punctuation | yes | yes | occasional traditional bias | occasional traditional bias |
+| Speakers found | 5 | 2 | 2 | 2 |
+| HF token needed | **no** | yes (pyannote diarization) | yes | yes |
+| Hardware | any CPU | AMD iGPU (ROCm) or CPU | Ryzen AI NPU | any |
+
+Backend selection guide:
+
+- **`funasr`** — default for Chinese meetings: fastest, no HF token,
+  built-in diarization.
+- **`firered`** — when Chinese transcription accuracy matters more than
+  speed (formal minutes, downstream LLM summarization). AED variant
+  (`asr_type="aed"`) is ~10x faster with slightly lower accuracy.
+- **`whispercpp`** — multilingual coverage, or to offload work to the NPU
+  and keep CPU/GPU free.
+- **`pytorch`** — original pipeline, kept as the reference implementation.

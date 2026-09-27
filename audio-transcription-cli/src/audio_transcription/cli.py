@@ -90,7 +90,7 @@ def transcribe_audio(
     backend: str = typer.Option(
         "pytorch",
         "--backend", "-b",
-        help="Transcription backend (pytorch, whispercpp, funasr). whispercpp runs the encoder on the AMD NPU via VitisAI; funasr is Chinese-optimized with built-in diarization"
+        help="Transcription backend (pytorch, whispercpp, funasr, firered). whispercpp runs the encoder on the AMD NPU via VitisAI; funasr is Chinese-optimized with built-in diarization; firered is FireRedASR2S (top Chinese accuracy, GPU via ROCm)"
     )
 ):
     """Transcribe audio files using Whisper with optional Distil-Whisper assistant model."""
@@ -190,7 +190,7 @@ def diarize_audio(
     backend: str = typer.Option(
         "pytorch",
         "--backend", "-b",
-        help="Transcription backend (pytorch, whispercpp, funasr). whispercpp transcribes on the AMD NPU; funasr does Chinese ASR + CAM++ diarization in one call (no HF token needed)"
+        help="Transcription backend (pytorch, whispercpp, funasr, firered). whispercpp transcribes on the AMD NPU; funasr does Chinese ASR + CAM++ diarization in one call (no HF token needed); firered is FireRedASR2S (top Chinese accuracy, GPU via ROCm)"
     )
 ):
     """Transcribe with speaker diarization using WhisperX with optional Distil-Whisper assistant."""
@@ -306,7 +306,7 @@ def process_full(
     backend: str = typer.Option(
         "pytorch",
         "--backend", "-b",
-        help="Transcription backend (pytorch, whispercpp, funasr). whispercpp runs the encoder on the AMD NPU via VitisAI; funasr is Chinese-optimized with built-in diarization"
+        help="Transcription backend (pytorch, whispercpp, funasr, firered). whispercpp runs the encoder on the AMD NPU via VitisAI; funasr is Chinese-optimized with built-in diarization; firered is FireRedASR2S (top Chinese accuracy, GPU via ROCm)"
     )
 ):
     """Process audio files with both transcription and diarization using optional Distil-Whisper assistant."""
@@ -388,7 +388,7 @@ def _validate_model_size(model_size: str):
 
 def _validate_backend(backend: str):
     """Validate transcription backend."""
-    valid_backends = ["pytorch", "whispercpp", "funasr"]
+    valid_backends = ["pytorch", "whispercpp", "funasr", "firered"]
     if backend not in valid_backends:
         console.print(f"❌ [red]Invalid backend: {backend}[/red]")
         console.print(f"Valid options: {', '.join(valid_backends)}")

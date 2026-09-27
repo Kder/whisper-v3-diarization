@@ -29,6 +29,7 @@ Both interfaces use the same robust backend processing engine, ensuring consiste
 - **Distil-Whisper Support**: Optional 2-5x speed boost with assistant model
 - **AMD NPU Support**: Optional pluggable backend runs Whisper on AMD Ryzen AI NPUs (XDNA2) via whisper.cpp + VitisAI, with diarization reusing the NPU transcript — see [NPU Backend](NPU_BACKEND.md)
 - **FunASR Backend**: Chinese-optimized pipeline (paraformer-zh + VAD + punctuation + CAM++ diarization) in a single call — no HuggingFace token needed, ~17x realtime on CPU
+- **FireRedASR2S Backend**: Xiaohongshu's FireRedASR2-LLM (8.3B) for top-accuracy Chinese ASR (CER 2.89% on AISHELL-1), running on AMD iGPUs via ROCm in a dedicated venv — see [NPU Backend](NPU_BACKEND.md)
 
 ### GUI-Specific Features
 - **🎨 Modern Interface**: Clean black/white design optimized for readability

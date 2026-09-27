@@ -502,18 +502,158 @@ class FunASRBackend(TranscriptionBackend):
         return "\n".join(lines)
 
 
+class FireRedBackend(TranscriptionBackend):
+    """FireRedASR2S backend (Xiaohongshu) — top-accuracy Chinese ASR.
+
+    Runs the FireRedASR2 all-in-one system (FireRedVAD + FireRedLID +
+    FireRedASR2 + FireRedPunc) in a DEDICATED Python environment via a
+    subprocess worker, because it needs its own PyTorch build (e.g. a ROCm
+    gfx1151 build for AMD iGPU inference) that would conflict with the main
+    project environment.
+
+    Configuration (constructor arg > env var > default):
+        python_path  / FIRERED_PYTHON       Python of the firered venv
+        models_root  / FIRERED_MODELS_ROOT  dir containing FireRedASR2-LLM,
+                                            FireRedVAD, FireRedLID, FireRedPunc
+    """
+
+    name = "firered"
+
+    DEFAULT_PYTHON = (
+        r"C:\Users\llf21\Documents\kimi\tasks\2026-09-23\22-51-06-22cd18c8"
+        r"\firered-venv\Scripts\python.exe"
+    )
+    DEFAULT_MODELS_ROOT = (
+        r"C:\Users\llf21\Documents\kimi\tasks\2026-09-23\22-51-06-22cd18c8"
+        r"\FireRedASR2S-main\pretrained_models"
+    )
+
+    def __init__(
+        self,
+        python_path: Optional[str] = None,
+        models_root: Optional[str] = None,
+        asr_type: str = "llm",
+        use_gpu: bool = True,
+        timeout: int = 7200,
+    ):
+        self.python_path = Path(
+            python_path or os.getenv("FIRERED_PYTHON") or self.DEFAULT_PYTHON
+        )
+        self.models_root = Path(
+            models_root or os.getenv("FIRERED_MODELS_ROOT") or self.DEFAULT_MODELS_ROOT
+        )
+        self.asr_type = asr_type
+        self.use_gpu = use_gpu
+        self.timeout = timeout
+        self.worker_path = Path(__file__).parent / "firered_worker.py"
+
+        logger.info(
+            "FireRedBackend initialized - python: %s, models: %s, asr: %s, gpu: %s",
+            self.python_path, self.models_root, asr_type, use_gpu,
+        )
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        language: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        model_name = f"FireRedASR2-{self.asr_type.upper()}"
+        try:
+            if not self.python_path.exists():
+                raise FileNotFoundError(
+                    f"FireRed Python not found at {self.python_path}. "
+                    "Set FIRERED_PYTHON to the dedicated venv interpreter."
+                )
+            if not self.worker_path.exists():
+                raise FileNotFoundError(f"Worker script missing: {self.worker_path}")
+
+            with tempfile.TemporaryDirectory(prefix="firered_") as tmp:
+                tmp_dir = Path(tmp)
+                wav_path = WhisperCppBackend._to_16k_wav(audio_path, tmp_dir)
+                out_json = tmp_dir / "result.json"
+
+                cmd = [
+                    str(self.python_path),
+                    str(self.worker_path),
+                    "--wav", str(wav_path),
+                    "--out", str(out_json),
+                    "--models-root", str(self.models_root),
+                    "--asr-type", self.asr_type,
+                ]
+                if not self.use_gpu:
+                    cmd.append("--cpu")
+
+                logger.info("Running FireRedASR2S worker: %s", " ".join(cmd))
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.timeout,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"FireRed worker exited with code {proc.returncode}: "
+                        f"{(proc.stderr or proc.stdout or '')[-2000:]}"
+                    )
+                if not out_json.exists():
+                    raise RuntimeError("FireRed worker produced no output file")
+
+                with open(out_json, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+
+            segments: List[Dict[str, Any]] = []
+            for sent in payload.get("sentences", []):
+                text = (sent.get("text") or "").strip()
+                if not text:
+                    continue
+                segments.append(
+                    {
+                        "start": sent.get("start_ms", 0) / 1000.0,
+                        "end": sent.get("end_ms", 0) / 1000.0,
+                        "text": text,
+                    }
+                )
+
+            text = " ".join(seg["text"] for seg in segments).strip()
+            if not text:
+                text = (payload.get("text") or "").strip()
+
+            return {
+                "success": True,
+                "text": text,
+                "chunks": segments,
+                "language": language or "zh",
+                "model": model_name,
+                "backend": self.name,
+                "timestamp": str(datetime.now()),
+            }
+
+        except Exception as e:
+            logger.exception("FireRedASR2S transcription failed for %s", audio_path)
+            return {
+                "success": False,
+                "error": str(e),
+                "model": model_name,
+                "backend": self.name,
+            }
+
+
 def create_backend(name: str = "pytorch", **kwargs: Any) -> TranscriptionBackend:
     """Factory for transcription backends.
 
     Args:
-        name: "pytorch" (original HF pipeline), "whispercpp" (NPU offload)
-            or "funasr" (Chinese-optimized, built-in CAM++ diarization).
+        name: "pytorch" (original HF pipeline), "whispercpp" (NPU offload),
+            "funasr" (Chinese-optimized, built-in CAM++ diarization) or
+            "firered" (FireRedASR2S, top-accuracy Chinese ASR, GPU via ROCm).
         **kwargs: forwarded to the backend constructor.
     """
     backends = {
         PyTorchBackend.name: PyTorchBackend,
         WhisperCppBackend.name: WhisperCppBackend,
         FunASRBackend.name: FunASRBackend,
+        FireRedBackend.name: FireRedBackend,
     }
     if name not in backends:
         raise ValueError(
