@@ -27,6 +27,7 @@ Both interfaces use the same robust backend processing engine, ensuring consiste
 - **Comprehensive Audio Support**: MP3, WAV, FLAC, OGG, M4A, AAC (up to 500MB)
 - **GPU Acceleration**: CUDA support for 10-50x faster processing
 - **Distil-Whisper Support**: Optional 2-5x speed boost with assistant model
+- **AMD NPU Support**: Optional pluggable backend runs Whisper on AMD Ryzen AI NPUs (XDNA2) via whisper.cpp + VitisAI, with diarization reusing the NPU transcript — see [NPU Backend](NPU_BACKEND.md)
 
 ### GUI-Specific Features
 - **🎨 Modern Interface**: Clean black/white design optimized for readability

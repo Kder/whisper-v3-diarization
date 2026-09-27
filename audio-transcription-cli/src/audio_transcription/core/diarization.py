@@ -84,21 +84,33 @@ def smooth_speaker_labels(segments: List[Dict], window_size: int = 3) -> List[Di
         if "speaker" not in smoothed_segments[i]:
             continue
 
-        # Define window boundaries
+        # Long segments are real speaker turns, not label flicker — the whole
+        # point of smoothing is to fix brief mislabeled segments, so leave
+        # confident long turns untouched. (Without this guard, short dialogues
+        # with alternating speakers collapse to a single label.)
+        duration = segments[i].get("end", 0.0) - segments[i].get("start", 0.0)
+        if duration >= 2.0:
+            continue
+
+        # Define window boundaries; vote on the ORIGINAL labels so one flip
+        # cannot cascade into the next segment's window
         start_idx = max(0, i - window_size // 2)
-        end_idx = min(len(smoothed_segments), i + window_size // 2 + 1)
+        end_idx = min(len(segments), i + window_size // 2 + 1)
 
         # Collect speaker labels from window
         window_speakers = [
             seg.get("speaker")
-            for seg in smoothed_segments[start_idx:end_idx]
+            for seg in segments[start_idx:end_idx]
             if "speaker" in seg
         ]
 
-        # Assign most common speaker in window
+        # Assign most common speaker in window, but only on a clear majority —
+        # a tie means no evidence to override the original label
         if window_speakers:
-            most_common_speaker = Counter(window_speakers).most_common(1)[0][0]
-            smoothed_segments[i]["speaker"] = most_common_speaker
+            counts = Counter(window_speakers).most_common()
+            if len(counts) > 1 and counts[0][1] == counts[1][1]:
+                continue
+            smoothed_segments[i]["speaker"] = counts[0][0]
 
     logger.debug(f"Applied speaker label smoothing with window size {window_size}")
     return smoothed_segments
@@ -221,14 +233,20 @@ def validate_and_clean_diarization(segments: List[Dict]) -> List[Dict]:
     logger.info(f"Starting post-processing validation on {len(segments)} segments")
 
     # Step 1: Check for unlabeled segments and assign from neighbors
-    unlabeled = [i for i, seg in enumerate(segments) if "speaker" not in seg or not seg.get("speaker")]
+    # ("UNKNOWN" from assign_word_speakers counts as unlabeled too)
+    unlabeled = [
+        i for i, seg in enumerate(segments)
+        if "speaker" not in seg or not seg.get("speaker") or seg.get("speaker") == "UNKNOWN"
+    ]
     if unlabeled:
         logger.warning(f"Found {len(unlabeled)} unlabeled segments, assigning from neighbors")
         for i in unlabeled:
-            if i > 0 and "speaker" in segments[i-1]:
-                segments[i]["speaker"] = segments[i-1]["speaker"]
-            elif i < len(segments) - 1 and "speaker" in segments[i+1]:
-                segments[i]["speaker"] = segments[i+1]["speaker"]
+            prev_speaker = segments[i-1].get("speaker") if i > 0 else None
+            next_speaker = segments[i+1].get("speaker") if i < len(segments) - 1 else None
+            if prev_speaker and prev_speaker != "UNKNOWN":
+                segments[i]["speaker"] = prev_speaker
+            elif next_speaker and next_speaker != "UNKNOWN":
+                segments[i]["speaker"] = next_speaker
             else:
                 segments[i]["speaker"] = "SPEAKER_00"  # Default fallback
 
@@ -333,121 +351,15 @@ class WhisperXDiarizer:
             if self.device == "cuda":
                 torch.cuda.empty_cache()
 
-            # Step 3: Align whisper output for word-level timestamps
-            logger.info(f"Step 3/5: Aligning transcription for word-level timestamps")
-            if self.align_model is None or self.align_metadata is None:
-                self.align_model, self.align_metadata = whisperx.load_align_model(
-                    language_code=detected_language,
-                    device=self.device
-                )
-                logger.info(f"Alignment model loaded for language: {detected_language}")
-
-            result = whisperx.align(
-                result["segments"],
-                self.align_model,
-                self.align_metadata,
-                audio,
-                self.device,
-                return_char_alignments=False
+            # Steps 3-6: align -> diarize -> assign speakers -> clean
+            return self._align_and_diarize(
+                audio=audio,
+                transcript_segments=result["segments"],
+                detected_language=detected_language,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                transcription_model_label=f"whisperx-{self.model_size}"
             )
-            logger.info("Alignment complete - word-level timestamps generated")
-
-            # Clean up alignment model if memory is tight
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-
-            # Step 4: Perform speaker diarization
-            logger.info(f"Step 4/5: Performing speaker diarization")
-            if self.diarize_model is None:
-                # Try to load the diarization model with proper error handling
-                # Use speaker-diarization-3.1 which is designed for pyannote.audio 3.x
-                # This version removes problematic onnxruntime usage and runs in pure PyTorch
-                try:
-                    self.diarize_model = whisperx.DiarizationPipeline(
-                        model_name="pyannote/speaker-diarization-3.1",  # Native v3.1 model for pyannote.audio 3.x
-                        use_auth_token=self.hf_token,
-                        device=self.device
-                    )
-                    logger.info("Diarization pipeline loaded successfully (pyannote/speaker-diarization-3.1)")
-                except Exception as e:
-                    logger.error(f"Failed to load diarization pipeline: {e}")
-                    # Try alternative import path with explicit model version
-                    try:
-                        from whisperx.diarize import DiarizationPipeline
-                        self.diarize_model = DiarizationPipeline(
-                            model_name="pyannote/speaker-diarization-3.1",  # Native v3.1 model
-                            use_auth_token=self.hf_token,
-                            device=self.device
-                        )
-                        logger.info("Diarization pipeline loaded via alternative import (pyannote/speaker-diarization-3.1)")
-                    except Exception as e2:
-                        logger.error(f"Alternative import also failed: {e2}")
-                        raise RuntimeError(
-                            "Failed to load diarization pipeline. "
-                            "Please ensure pyannote.audio is installed and you have accepted "
-                            "the terms at: https://huggingface.co/pyannote/speaker-diarization-3.1 "
-                            "and https://huggingface.co/pyannote/segmentation-3.0"
-                        )
-
-            # Run diarization with optional speaker count constraints
-            diarize_options = {}
-            if min_speakers is not None:
-                diarize_options["min_speakers"] = min_speakers
-            if max_speakers is not None:
-                diarize_options["max_speakers"] = max_speakers
-
-            logger.info(f"Running diarization with options: {diarize_options}")
-            diarize_segments = self.diarize_model(audio, **diarize_options)
-            logger.info("Speaker diarization complete")
-
-            # Clean up diarization model if memory is tight
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-
-            # Step 5: Assign speaker labels to words and segments
-            logger.info(f"Step 5/5: Assigning speaker labels to transcript")
-            result = whisperx.assign_word_speakers(diarize_segments, result)
-            logger.info("Speaker assignment complete")
-
-            # Extract speaker information
-            segments_with_speakers = []
-
-            for segment in result["segments"]:
-                speaker = segment.get("speaker", "UNKNOWN")
-
-                segments_with_speakers.append({
-                    "start": segment.get("start", 0.0),
-                    "end": segment.get("end", 0.0),
-                    "text": segment.get("text", "").strip(),
-                    "speaker": speaker,
-                    "words": segment.get("words", [])
-                })
-
-            # Step 6: Apply post-processing to improve accuracy
-            logger.info("Applying post-processing to clean and validate diarization results")
-            segments_with_speakers = validate_and_clean_diarization(segments_with_speakers)
-
-            # Extract final speaker information after cleaning
-            speakers_found = set()
-            for segment in segments_with_speakers:
-                speaker = segment.get("speaker", "UNKNOWN")
-                speakers_found.add(speaker)
-
-            # Generate formatted transcript
-            formatted_transcript = self._format_transcript(segments_with_speakers)
-
-            logger.info(f"Diarization complete: {len(segments_with_speakers)} segments, {len(speakers_found)} speakers")
-
-            return {
-                "success": True,
-                "segments": segments_with_speakers,
-                "num_speakers": len(speakers_found),
-                "speakers": sorted(list(speakers_found)),
-                "language": detected_language,
-                "formatted_transcript": formatted_transcript,
-                "model": f"whisperx-{self.model_size}",
-                "diarization_method": "pyannote-audio"
-            }
 
         except Exception as e:
             logger.exception(f"WhisperX diarization failed for {audio_path}")
@@ -459,6 +371,212 @@ class WhisperXDiarizer:
         finally:
             # Always clean up memory after processing
             self._cleanup_memory()
+
+    def diarize_with_transcript(
+        self,
+        audio_path: Path,
+        transcript: Dict[str, Any],
+        language: Optional[str] = None,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Perform speaker diarization using an externally produced transcript.
+
+        Skips WhisperX transcription entirely: the transcript (e.g. from the
+        whisper.cpp NPU backend) supplies segment-level text and timestamps,
+        and this method only runs alignment, pyannote diarization and speaker
+        assignment. This avoids running a second transcription model on CPU.
+
+        Args:
+            audio_path: Path to audio file
+            transcript: Result dict from a TranscriptionBackend, containing
+                "chunks": [{"start", "end", "text"}, ...] and "language"
+            language: Language code override (auto-detected if None)
+            min_speakers: Minimum number of speakers (optional)
+            max_speakers: Maximum number of speakers (optional)
+
+        Returns:
+            Dictionary with diarization results including segments with speaker labels
+        """
+        try:
+            logger.info(f"Starting diarization with external transcript for: {audio_path}")
+
+            segments = transcript.get("chunks") or []
+            if not segments:
+                raise ValueError(
+                    "External transcript contains no segments; cannot diarize. "
+                    "Use a backend that returns segment-level timestamps."
+                )
+
+            detected_language = language or transcript.get("language") or "en"
+            model_label = transcript.get("model", "external-transcript")
+
+            audio = load_audio_with_static_ffmpeg(str(audio_path), sr=16000)
+
+            return self._align_and_diarize(
+                audio=audio,
+                transcript_segments=segments,
+                detected_language=detected_language,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                transcription_model_label=model_label
+            )
+
+        except Exception as e:
+            logger.exception(f"Diarization with external transcript failed for {audio_path}")
+            return {
+                "success": False,
+                "error": str(e),
+                "error_type": type(e).__name__
+            }
+        finally:
+            self._cleanup_memory()
+
+    def _align_and_diarize(
+        self,
+        audio,
+        transcript_segments: List[Dict],
+        detected_language: str,
+        min_speakers: Optional[int],
+        max_speakers: Optional[int],
+        transcription_model_label: str
+    ) -> Dict[str, Any]:
+        """Shared pipeline: align -> pyannote diarize -> assign speakers -> clean.
+
+        Works with segments from either WhisperX transcription or an external
+        TranscriptionBackend (anything providing start/end/text per segment).
+        """
+        # Step 3: Align for word-level timestamps; fall back to segment-level
+        logger.info("Aligning transcription for word-level timestamps")
+        aligned_segments = transcript_segments
+        try:
+            if self.align_model is None or self.align_metadata is None:
+                self.align_model, self.align_metadata = whisperx.load_align_model(
+                    language_code=detected_language,
+                    device=self.device
+                )
+                logger.info(f"Alignment model loaded for language: {detected_language}")
+
+            aligned = whisperx.align(
+                transcript_segments,
+                self.align_model,
+                self.align_metadata,
+                audio,
+                self.device,
+                return_char_alignments=False
+            )
+            aligned_segments = aligned["segments"]
+            logger.info("Alignment complete - word-level timestamps generated")
+        except Exception as e:
+            logger.warning(
+                f"Alignment failed ({e}); continuing with segment-level timestamps. "
+                "Speaker assignment will be per-segment instead of per-word."
+            )
+
+        # Clean up alignment model if memory is tight
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        # Step 4: Perform speaker diarization
+        logger.info("Performing speaker diarization")
+        if self.diarize_model is None:
+            from whisperx.diarize import DiarizationPipeline
+            # Load with version-adaptive kwargs: whisperX >= 3.8 (pyannote-audio
+            # 4.x) renamed use_auth_token -> token and defaults to the
+            # community-1 model; older releases use use_auth_token + 3.1.
+            try:
+                self.diarize_model = DiarizationPipeline(
+                    model_name="pyannote/speaker-diarization-community-1",
+                    token=self.hf_token,
+                    device=self.device
+                )
+                logger.info("Diarization pipeline loaded (pyannote/speaker-diarization-community-1)")
+            except TypeError:
+                self.diarize_model = DiarizationPipeline(
+                    model_name="pyannote/speaker-diarization-3.1",
+                    use_auth_token=self.hf_token,
+                    device=self.device
+                )
+                logger.info("Diarization pipeline loaded (pyannote/speaker-diarization-3.1)")
+            except Exception as e:
+                logger.error(f"Failed to load diarization pipeline: {e}")
+                raise RuntimeError(
+                    "Failed to load diarization pipeline. "
+                    "Please ensure pyannote.audio is installed and you have accepted "
+                    "the terms at: https://huggingface.co/pyannote/speaker-diarization-community-1 "
+                    "(or speaker-diarization-3.1) and https://huggingface.co/pyannote/segmentation-3.0"
+                ) from e
+
+        # Run diarization with optional speaker count constraints
+        diarize_options = {}
+        if min_speakers is not None:
+            diarize_options["min_speakers"] = min_speakers
+        if max_speakers is not None:
+            diarize_options["max_speakers"] = max_speakers
+
+        logger.info(f"Running diarization with options: {diarize_options}")
+        diarize_segments = self.diarize_model(audio, **diarize_options)
+        logger.info("Speaker diarization complete")
+
+        # Clean up diarization model if memory is tight
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        # Step 5: Assign speaker labels to words and segments
+        logger.info("Assigning speaker labels to transcript")
+        try:
+            # fill_nearest: segments falling in gaps between pyannote turns
+            # get the nearest speaker instead of staying unlabeled
+            # (whisperX >= 3.8)
+            result = whisperx.assign_word_speakers(
+                diarize_segments, {"segments": aligned_segments},
+                fill_nearest=True
+            )
+        except TypeError:
+            result = whisperx.assign_word_speakers(
+                diarize_segments, {"segments": aligned_segments}
+            )
+        logger.info("Speaker assignment complete")
+
+        # Extract speaker information
+        segments_with_speakers = []
+
+        for segment in result["segments"]:
+            speaker = segment.get("speaker", "UNKNOWN")
+
+            segments_with_speakers.append({
+                "start": segment.get("start", 0.0),
+                "end": segment.get("end", 0.0),
+                "text": segment.get("text", "").strip(),
+                "speaker": speaker,
+                "words": segment.get("words", [])
+            })
+
+        # Step 6: Apply post-processing to improve accuracy
+        logger.info("Applying post-processing to clean and validate diarization results")
+        segments_with_speakers = validate_and_clean_diarization(segments_with_speakers)
+
+        # Extract final speaker information after cleaning
+        speakers_found = set()
+        for segment in segments_with_speakers:
+            speaker = segment.get("speaker", "UNKNOWN")
+            speakers_found.add(speaker)
+
+        # Generate formatted transcript
+        formatted_transcript = self._format_transcript(segments_with_speakers)
+
+        logger.info(f"Diarization complete: {len(segments_with_speakers)} segments, {len(speakers_found)} speakers")
+
+        return {
+            "success": True,
+            "segments": segments_with_speakers,
+            "num_speakers": len(speakers_found),
+            "speakers": sorted(list(speakers_found)),
+            "language": detected_language,
+            "formatted_transcript": formatted_transcript,
+            "model": transcription_model_label,
+            "diarization_method": "pyannote-audio"
+        }
 
     def _format_transcript(self, segments) -> str:
         """Format segments into readable transcript with speaker labels.

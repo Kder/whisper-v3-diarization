@@ -86,12 +86,18 @@ def transcribe_audio(
         False,
         "--use-assistant", "-a",
         help="Use Distil-Whisper as assistant model for 2-5x speed improvement"
+    ),
+    backend: str = typer.Option(
+        "pytorch",
+        "--backend", "-b",
+        help="Transcription backend (pytorch, whispercpp). whispercpp runs the encoder on the AMD NPU via VitisAI"
     )
 ):
     """Transcribe audio files using Whisper with optional Distil-Whisper assistant model."""
-    
+
     # Validate inputs
     _validate_model_size(model_size)
+    _validate_backend(backend)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Initialize processor with assistant model option
@@ -99,7 +105,8 @@ def transcribe_audio(
         model_size=model_size,
         device=device,
         hf_token=config.hf_token,
-        use_assistant=use_assistant
+        use_assistant=use_assistant,
+        backend=backend
     )
     
     # Process files with progress indication
@@ -179,17 +186,23 @@ def diarize_audio(
         False,
         "--use-assistant", "-a",
         help="Use Distil-Whisper as assistant model for 2-5x speed improvement"
+    ),
+    backend: str = typer.Option(
+        "pytorch",
+        "--backend", "-b",
+        help="Transcription backend (pytorch, whispercpp). whispercpp transcribes on the AMD NPU, then diarizes on that transcript"
     )
 ):
     """Transcribe with speaker diarization using WhisperX with optional Distil-Whisper assistant."""
-    
+
     if not config.hf_token:
         console.print("❌ [red]HuggingFace token required for speaker diarization![/red]")
         console.print("Set HF_TOKEN environment variable or use --hf-token option.")
         raise typer.Exit(1)
-    
+
     # Validate inputs
     _validate_model_size(model_size)
+    _validate_backend(backend)
     _validate_speaker_counts(min_speakers, max_speakers)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -198,7 +211,8 @@ def diarize_audio(
         model_size=model_size,
         device=device,
         hf_token=config.hf_token,
-        use_assistant=use_assistant
+        use_assistant=use_assistant,
+        backend=backend
     )
     
     # Process files with progress indication
@@ -286,16 +300,22 @@ def process_full(
         False,
         "--use-assistant", "-a",
         help="Use Distil-Whisper as assistant model for 2-5x speed improvement"
+    ),
+    backend: str = typer.Option(
+        "pytorch",
+        "--backend", "-b",
+        help="Transcription backend (pytorch, whispercpp). whispercpp runs the encoder on the AMD NPU via VitisAI"
     )
 ):
     """Process audio files with both transcription and diarization using optional Distil-Whisper assistant."""
-    
+
     # Create output directories
     transcription_dir.mkdir(parents=True, exist_ok=True)
     diarization_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Validate inputs
     _validate_model_size(model_size)
+    _validate_backend(backend)
     if min_speakers or max_speakers:
         _validate_speaker_counts(min_speakers, max_speakers)
 
@@ -304,7 +324,8 @@ def process_full(
         model_size=model_size,
         device=device,
         hf_token=config.hf_token,
-        use_assistant=use_assistant
+        use_assistant=use_assistant,
+        backend=backend
     )
     
     # Process files
@@ -360,6 +381,15 @@ def _validate_model_size(model_size: str):
     if model_size not in valid_models:
         console.print(f"❌ [red]Invalid model size: {model_size}[/red]")
         console.print(f"Valid options: {', '.join(valid_models)}")
+        raise typer.Exit(1)
+
+
+def _validate_backend(backend: str):
+    """Validate transcription backend."""
+    valid_backends = ["pytorch", "whispercpp"]
+    if backend not in valid_backends:
+        console.print(f"❌ [red]Invalid backend: {backend}[/red]")
+        console.print(f"Valid options: {', '.join(valid_backends)}")
         raise typer.Exit(1)
 
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Union
 from datetime import datetime
 
-from .transcription import WhisperTranscriber
+from .backends import create_backend
 from .diarization import WhisperXDiarizer
 from ..utils.file_handler import AudioFileHandler
 
@@ -22,7 +22,9 @@ class AudioProcessor:
         model_size: str = "large-v3",
         device: str = "auto",
         hf_token: Optional[str] = None,
-        use_assistant: bool = False
+        use_assistant: bool = False,
+        backend: str = "pytorch",
+        backend_options: Optional[Dict[str, Any]] = None
     ):
         """Initialize audio processor.
 
@@ -31,19 +33,31 @@ class AudioProcessor:
             device: Processing device (auto, cpu, cuda)
             hf_token: HuggingFace token for diarization
             use_assistant: Use Distil-Whisper as assistant model for speed optimization
+            backend: Transcription backend ("pytorch" or "whispercpp")
+            backend_options: Extra options forwarded to the backend constructor
+                (e.g. exe_path/model_path/flexmlrt_root for whispercpp)
         """
         self.model_size = model_size
         self.device = self._setup_device(device)
         self.hf_token = hf_token
         self.use_assistant = use_assistant
+        self.backend_name = backend
 
         # Initialize components
         self.file_handler = AudioFileHandler()
-        self.transcriber = WhisperTranscriber(model_size, self.device, use_assistant=use_assistant)
+        if backend == "pytorch":
+            self.transcriber = create_backend(
+                "pytorch",
+                model_size=model_size,
+                device=self.device,
+                use_assistant=use_assistant,
+            )
+        else:
+            self.transcriber = create_backend(backend, **(backend_options or {}))
         self.diarizer = WhisperXDiarizer(self.device, hf_token, model_size) if hf_token else None
 
         assistant_info = " with Distil-Whisper assistant" if use_assistant else ""
-        logger.info(f"AudioProcessor initialized - Model: {model_size}, Device: {self.device}{assistant_info}")
+        logger.info(f"AudioProcessor initialized - Model: {model_size}, Device: {self.device}, Backend: {backend}{assistant_info}")
     
     def _setup_device(self, device: str) -> str:
         """Setup processing device."""
@@ -159,12 +173,34 @@ class AudioProcessor:
                 }
             
             # Process with diarization
-            result = self.diarizer.diarize(
-                audio_path=file_path,
-                language=language,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers
-            )
+            if self.backend_name != "pytorch":
+                # External transcription backend (e.g. whisper.cpp on the NPU):
+                # transcribe there first, then diarize on that transcript so
+                # WhisperX does not run a second transcription on CPU.
+                logger.info(f"Transcribing with '{self.backend_name}' backend before diarization")
+                transcript = self.transcriber.transcribe(
+                    audio_path=file_path,
+                    language=language
+                )
+                if not transcript["success"]:
+                    return {
+                        "success": False,
+                        "error": f"Transcription stage failed: {transcript.get('error')}"
+                    }
+                result = self.diarizer.diarize_with_transcript(
+                    audio_path=file_path,
+                    transcript=transcript,
+                    language=language,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers
+                )
+            else:
+                result = self.diarizer.diarize(
+                    audio_path=file_path,
+                    language=language,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers
+                )
             
             if result["success"]:
                 # Save results
