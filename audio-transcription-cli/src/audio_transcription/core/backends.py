@@ -305,16 +305,215 @@ class WhisperCppBackend(TranscriptionBackend):
         return segments, detected_language
 
 
+class FunASRBackend(TranscriptionBackend):
+    """FunASR (Alibaba Tongyi Lab) backend — Chinese-optimized ASR with
+    optional built-in CAM++ speaker diarization.
+
+    A single ``generate()`` call chains VAD (fsmn-vad) + ASR (paraformer-zh
+    or SenseVoice) + punctuation (ct-punc) + speaker embedding clustering
+    (CAM++), returning sentence-level text, timestamps AND speaker labels —
+    no HuggingFace token or gated-model acceptance required (models download
+    from ModelScope).
+
+    When ``spk_model`` is set, ``transcribe()`` chunks carry a ``speaker``
+    field and ``diarize()`` can produce the full diarization result without
+    touching WhisperX/pyannote at all.
+    """
+
+    name = "funasr"
+
+    def __init__(
+        self,
+        model: str = "paraformer-zh",
+        vad_model: Optional[str] = "fsmn-vad",
+        punc_model: Optional[str] = "ct-punc",
+        spk_model: Optional[str] = "cam++",
+        device: str = "cpu",
+        batch_size_s: int = 300,
+    ):
+        self.model = model
+        self.vad_model = vad_model
+        self.punc_model = punc_model
+        self.spk_model = spk_model
+        self.device = device
+        self.batch_size_s = batch_size_s
+        self._impl = None  # lazy AutoModel
+
+        logger.info(
+            "FunASRBackend initialized - model: %s, spk: %s, device: %s",
+            model, spk_model, device,
+        )
+
+    # ------------------------------------------------------------------ API
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        language: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        try:
+            self._load()
+            result = self._run(audio_path, language)
+
+            segments = self._extract_segments(result)
+            text = " ".join(seg["text"] for seg in segments).strip()
+            if not text:
+                text = (result.get("text") or "").strip()
+
+            has_speakers = any("speaker" in seg for seg in segments)
+            return {
+                "success": True,
+                "text": text,
+                "chunks": segments,
+                "language": language or "zh",
+                "model": self.model,
+                "backend": self.name,
+                "has_speakers": has_speakers,
+                "timestamp": str(datetime.now()),
+            }
+
+        except Exception as e:
+            logger.exception("FunASR transcription failed for %s", audio_path)
+            return {
+                "success": False,
+                "error": str(e),
+                "model": self.model,
+                "backend": self.name,
+            }
+
+    def diarize(
+        self,
+        audio_path: Path,
+        language: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Full diarization result from the built-in CAM++ pipeline.
+
+        Returns the same contract as WhisperXDiarizer.diarize() so the rest
+        of the application (file saving, GUI) works unchanged.
+        """
+        if not self.spk_model:
+            return {
+                "success": False,
+                "error": "FunASRBackend was created without spk_model; "
+                         "speaker diarization is unavailable.",
+            }
+
+        transcript = self.transcribe(audio_path=audio_path, language=language)
+        if not transcript["success"]:
+            return transcript
+
+        segments = transcript["chunks"]
+        if not any("speaker" in seg for seg in segments):
+            return {
+                "success": False,
+                "error": "FunASR result contains no speaker labels "
+                         "(sentence_info missing).",
+            }
+
+        speakers = sorted({seg["speaker"] for seg in segments})
+        formatted = self._format_transcript(segments)
+
+        return {
+            "success": True,
+            "segments": segments,
+            "num_speakers": len(speakers),
+            "speakers": speakers,
+            "language": transcript["language"],
+            "formatted_transcript": formatted,
+            "model": transcript["model"],
+            "backend": self.name,
+            "diarization_method": f"funasr-{self.spk_model}",
+        }
+
+    def cleanup(self) -> None:
+        if self._impl is not None:
+            del self._impl
+            self._impl = None
+            logger.info("FunASR model cleaned up")
+
+    # ------------------------------------------------------------- internal
+
+    def _load(self) -> None:
+        if self._impl is not None:
+            return
+        from funasr import AutoModel  # deferred: heavy import
+
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "device": self.device,
+            "disable_update": True,
+        }
+        if self.vad_model:
+            kwargs["vad_model"] = self.vad_model
+        if self.punc_model:
+            kwargs["punc_model"] = self.punc_model
+        if self.spk_model:
+            kwargs["spk_model"] = self.spk_model
+
+        logger.info("Loading FunASR pipeline: %s", kwargs)
+        self._impl = AutoModel(**kwargs)
+        logger.info("FunASR pipeline loaded")
+
+    def _run(self, audio_path: Path, language: Optional[str]) -> Dict[str, Any]:
+        gen_kwargs: Dict[str, Any] = {
+            "input": str(audio_path),
+            "batch_size_s": self.batch_size_s,
+        }
+        # SenseVoice-family models accept language/itn; paraformer-zh does not
+        if "sensevoice" in self.model.lower():
+            gen_kwargs["language"] = language or "auto"
+            gen_kwargs["use_itn"] = True
+
+        res = self._impl.generate(**gen_kwargs)
+        if not res:
+            raise RuntimeError("FunASR returned an empty result")
+        return res[0]
+
+    @staticmethod
+    def _extract_segments(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Map FunASR sentence_info to the segment contract.
+
+        sentence_info entries: {"start": ms, "end": ms, "sentence"|"text",
+        "spk": int, ...}
+        """
+        segments: List[Dict[str, Any]] = []
+        for item in result.get("sentence_info") or []:
+            text = (item.get("sentence") or item.get("text") or "").strip()
+            if not text:
+                continue
+            seg: Dict[str, Any] = {
+                "start": item.get("start", 0) / 1000.0,
+                "end": item.get("end", 0) / 1000.0,
+                "text": text,
+            }
+            if "spk" in item:
+                seg["speaker"] = f"SPEAKER_{int(item['spk']):02d}"
+            segments.append(seg)
+        return segments
+
+    @staticmethod
+    def _format_transcript(segments: List[Dict[str, Any]]) -> str:
+        lines = []
+        for seg in segments:
+            minutes = int(seg["start"] // 60)
+            secs = int(seg["start"] % 60)
+            speaker = seg.get("speaker", "UNKNOWN")
+            lines.append(f"[{minutes:02d}:{secs:02d}] {speaker}: {seg['text']}")
+        return "\n".join(lines)
+
+
 def create_backend(name: str = "pytorch", **kwargs: Any) -> TranscriptionBackend:
     """Factory for transcription backends.
 
     Args:
-        name: "pytorch" (original HF pipeline) or "whispercpp" (NPU offload).
+        name: "pytorch" (original HF pipeline), "whispercpp" (NPU offload)
+            or "funasr" (Chinese-optimized, built-in CAM++ diarization).
         **kwargs: forwarded to the backend constructor.
     """
     backends = {
         PyTorchBackend.name: PyTorchBackend,
         WhisperCppBackend.name: WhisperCppBackend,
+        FunASRBackend.name: FunASRBackend,
     }
     if name not in backends:
         raise ValueError(

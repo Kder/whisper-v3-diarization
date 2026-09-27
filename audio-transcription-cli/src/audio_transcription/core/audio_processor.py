@@ -54,7 +54,12 @@ class AudioProcessor:
             )
         else:
             self.transcriber = create_backend(backend, **(backend_options or {}))
-        self.diarizer = WhisperXDiarizer(self.device, hf_token, model_size) if hf_token else None
+        # FunASR performs diarization internally (CAM++); WhisperX/pyannote
+        # (and its HuggingFace token) is not needed for that backend
+        if backend == "funasr":
+            self.diarizer = None
+        else:
+            self.diarizer = WhisperXDiarizer(self.device, hf_token, model_size) if hf_token else None
 
         assistant_info = " with Distil-Whisper assistant" if use_assistant else ""
         logger.info(f"AudioProcessor initialized - Model: {model_size}, Device: {self.device}, Backend: {backend}{assistant_info}")
@@ -149,12 +154,12 @@ class AudioProcessor:
         Returns:
             Dict with success status and results
         """
-        if not self.diarizer:
+        if self.backend_name != "funasr" and not self.diarizer:
             return {
                 "success": False,
                 "error": "Diarization not available - no HuggingFace token provided"
             }
-        
+
         try:
             # Validate audio
             validation_result = self.file_handler.validate_audio_file(file_path)
@@ -163,7 +168,7 @@ class AudioProcessor:
                     "success": False,
                     "error": f"Invalid audio file: {validation_result['errors']}"
                 }
-            
+
             # Load audio
             audio_data = self.file_handler.load_audio(file_path)
             if not audio_data["success"]:
@@ -171,9 +176,17 @@ class AudioProcessor:
                     "success": False,
                     "error": f"Failed to load audio: {audio_data['error']}"
                 }
-            
+
             # Process with diarization
-            if self.backend_name != "pytorch":
+            if self.backend_name == "funasr":
+                # FunASR chains VAD + ASR + punctuation + CAM++ speaker
+                # clustering in a single call — no WhisperX/pyannote needed
+                logger.info("Running FunASR built-in diarization (CAM++)")
+                result = self.transcriber.diarize(
+                    audio_path=file_path,
+                    language=language
+                )
+            elif self.backend_name != "pytorch":
                 # External transcription backend (e.g. whisper.cpp on the NPU):
                 # transcribe there first, then diarize on that transcript so
                 # WhisperX does not run a second transcription on CPU.

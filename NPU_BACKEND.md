@@ -114,3 +114,42 @@ Notes:
 - **Alignment resilience**: if no wav2vec2 alignment model exists for the
   detected language, the pipeline degrades to segment-level timestamps
   instead of failing.
+
+---
+
+# Alternative: FunASR Backend (Chinese-optimized, built-in diarization)
+
+For **pure-Chinese** meetings, the `funasr` backend is often the better
+choice: Alibaba's FunASR chains VAD (fsmn-vad) + ASR (paraformer-zh) +
+punctuation (ct-punc) + **CAM++ speaker diarization** in a single
+`generate()` call — no HuggingFace token, no gated models (weights download
+from ModelScope), and no WhisperX/pyannote involvement at all.
+
+```bash
+pip install funasr modelscope
+
+# One call: transcription + punctuation + speaker labels
+audio-transcription diarize meeting.mp3 --backend funasr
+```
+
+## Measured comparison (same 5-minute real-world Chinese meeting, CPU-only)
+
+| | `whispercpp` (NPU) + pyannote | `funasr` (CAM++) |
+| --- | --- | --- |
+| End-to-end time | ~220 s | **~17 s** (RTF ≈ 0.06) |
+| Transcription | Whisper large-v3-turbo | paraformer-zh |
+| Chinese output | occasional traditional-character bias | simplified, with punctuation |
+| Speakers found | 2 | 5 |
+| HF token / gated models | required (pyannote) | **not required** |
+
+Notes:
+
+- FunASR's Paraformer is non-autoregressive and extremely fast on CPU; the
+  NPU's speed advantage does not matter for this workload class.
+- CAM++ and pyannote can disagree on speaker count (CAM++ tends to find
+  more speakers); neither is ground truth — spot-check on your own audio.
+- The `funasr` backend runs on any machine (no NPU needed); use
+  `whispercpp` when you want Whisper's multilingual coverage or already
+  have the NPU stack set up.
+- SenseVoice (`model="iic/SenseVoiceSmall"`) is also supported as the ASR
+  model and adds emotion / audio-event tags.

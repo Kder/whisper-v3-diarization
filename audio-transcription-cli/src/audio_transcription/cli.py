@@ -90,7 +90,7 @@ def transcribe_audio(
     backend: str = typer.Option(
         "pytorch",
         "--backend", "-b",
-        help="Transcription backend (pytorch, whispercpp). whispercpp runs the encoder on the AMD NPU via VitisAI"
+        help="Transcription backend (pytorch, whispercpp, funasr). whispercpp runs the encoder on the AMD NPU via VitisAI; funasr is Chinese-optimized with built-in diarization"
     )
 ):
     """Transcribe audio files using Whisper with optional Distil-Whisper assistant model."""
@@ -190,20 +190,22 @@ def diarize_audio(
     backend: str = typer.Option(
         "pytorch",
         "--backend", "-b",
-        help="Transcription backend (pytorch, whispercpp). whispercpp transcribes on the AMD NPU, then diarizes on that transcript"
+        help="Transcription backend (pytorch, whispercpp, funasr). whispercpp transcribes on the AMD NPU; funasr does Chinese ASR + CAM++ diarization in one call (no HF token needed)"
     )
 ):
     """Transcribe with speaker diarization using WhisperX with optional Distil-Whisper assistant."""
-
-    if not config.hf_token:
-        console.print("❌ [red]HuggingFace token required for speaker diarization![/red]")
-        console.print("Set HF_TOKEN environment variable or use --hf-token option.")
-        raise typer.Exit(1)
 
     # Validate inputs
     _validate_model_size(model_size)
     _validate_backend(backend)
     _validate_speaker_counts(min_speakers, max_speakers)
+
+    # FunASR performs diarization internally (CAM++) and needs no HF token
+    if backend != "funasr" and not config.hf_token:
+        console.print("❌ [red]HuggingFace token required for speaker diarization![/red]")
+        console.print("Set HF_TOKEN environment variable or use --hf-token option.")
+        console.print("Tip: --backend funasr performs diarization without a HuggingFace token.")
+        raise typer.Exit(1)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Initialize processor with assistant model option
@@ -304,7 +306,7 @@ def process_full(
     backend: str = typer.Option(
         "pytorch",
         "--backend", "-b",
-        help="Transcription backend (pytorch, whispercpp). whispercpp runs the encoder on the AMD NPU via VitisAI"
+        help="Transcription backend (pytorch, whispercpp, funasr). whispercpp runs the encoder on the AMD NPU via VitisAI; funasr is Chinese-optimized with built-in diarization"
     )
 ):
     """Process audio files with both transcription and diarization using optional Distil-Whisper assistant."""
@@ -386,7 +388,7 @@ def _validate_model_size(model_size: str):
 
 def _validate_backend(backend: str):
     """Validate transcription backend."""
-    valid_backends = ["pytorch", "whispercpp"]
+    valid_backends = ["pytorch", "whispercpp", "funasr"]
     if backend not in valid_backends:
         console.print(f"❌ [red]Invalid backend: {backend}[/red]")
         console.print(f"Valid options: {', '.join(valid_backends)}")
